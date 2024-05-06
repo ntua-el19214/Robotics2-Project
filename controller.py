@@ -14,6 +14,8 @@ from math import sin, cos, atan2, pi, sqrt
 from numpy.linalg import inv, det, norm, pinv
 import numpy as np
 import time as t
+import matplotlib.pyplot as plt
+
 
 # Arm parameters
 # xArm7 kinematics class
@@ -46,6 +48,13 @@ class xArm7_controller():
         # gazebo model's states
         self.model_states = ModelStates()
 
+
+        # Lists to store joint angles and velocities
+        self.joint_angpos_data  = []
+        self.joint_angvel_data  = []
+        self.end_effector_cords = [] 
+        self.output_file = 'joint_data.txt'  # File to write data to
+
         # ROS SETUP
         # initialize subscribers for reading encoders and publishers for performing position control in the joint-space
         # Robot
@@ -68,9 +77,21 @@ class xArm7_controller():
 
     #SENSING CALLBACKS
     def joint_states_callback(self, msg):
-        # ROS callback to get the joint_states
-
         self.joint_states = msg
+        # ROS callback to get the joint_states
+        self.joint_angpos_data.append(msg.position)
+        self.joint_angvel_data.append(msg.velocity)
+        end_effector_coords_str = ', '.join(map(str, self.A07[:3,3]))
+        self.end_effector_cords.append(self.A07[:3,3])
+
+        # Write data to file
+        with open(self.output_file, 'a') as f:
+            # Write joint angles, velocities, and end effector coordinates to file
+            f.write(f"Joint Angles: {msg.position}\n")
+            f.write(f"Joint Velocities: {msg.velocity}\n")
+            f.write(f"End Effector Cords: [{end_effector_coords_str}]\n")
+            f.write("\n")  # Add a newline for readability
+
         # (e.g. the angular position of joint 1 is stored in :: self.joint_states.position[0])
 
     def model_states_callback(self, msg):
@@ -106,8 +127,8 @@ class xArm7_controller():
         T = 4
 
         # Define time vector
-        numOfSteps = 2001
-        Time       = np.linspace(0, 4, 2001)
+        numOfSteps = 1001
+        Time       = np.linspace(0, 4, numOfSteps)
 
         # Define end effector position and velocity vectors
         px = np.ones(numOfSteps)*0.617
@@ -123,125 +144,123 @@ class xArm7_controller():
 
         counter = 0
         while not rospy.is_shutdown():
+            for iStep in range(numOfSteps):
+                # Compute each transformation matrix wrt the base frame from joints' angular positions
+                self.A01 = self.kinematics.tf_A01(self.joint_angpos)
+                self.A02 = self.kinematics.tf_A02(self.joint_angpos)
+                self.A03 = self.kinematics.tf_A03(self.joint_angpos)
+                self.A04 = self.kinematics.tf_A04(self.joint_angpos)
+                self.A05 = self.kinematics.tf_A05(self.joint_angpos)
+                self.A06 = self.kinematics.tf_A06(self.joint_angpos)
+                self.A07 = self.kinematics.tf_A07(self.joint_angpos)
 
-            thisIterationIdx = np.mod(counter, numOfSteps)
+                # Compute jacobian matrix
+                J = self.kinematics.compute_jacobian(self.joint_angpos)
+                # pseudoinverse jacobian
+                pinvJ = pinv(J)
 
-            # Compute each transformation matrix wrt the base frame from joints' angular positions
-            self.A01 = self.kinematics.tf_A01(self.joint_angpos)
-            self.A02 = self.kinematics.tf_A02(self.joint_angpos)
-            self.A03 = self.kinematics.tf_A03(self.joint_angpos)
-            self.A04 = self.kinematics.tf_A04(self.joint_angpos)
-            self.A05 = self.kinematics.tf_A05(self.joint_angpos)
-            self.A06 = self.kinematics.tf_A06(self.joint_angpos)
-            self.A07 = self.kinematics.tf_A07(self.joint_angpos)
+                # First routine, calculate joint speeds
+                pDot = np.matrix([[pDotX[iStep]], [pDotY[iStep]], [pDotZ[iStep]]])
+                p    = np.matrix([[px[iStep]], [py[iStep]], [pz[iStep]]])
+                pReal= self.A07[:3,3]
+                K = 150
 
-            # Compute jacobian matrix
-            J = self.kinematics.compute_jacobian(self.joint_angpos)
-            # pseudoinverse jacobian
-            pinvJ = pinv(J)
-
-            # First routine, calculate joint speeds
-            pDot = np.matrix([[pDotX[thisIterationIdx]], [pDotY[thisIterationIdx]], [pDotZ[thisIterationIdx]]])
-            p    = np.matrix([[px[thisIterationIdx]], [py[thisIterationIdx]], [pz[thisIterationIdx]]])
-            pReal= self.A07[:3,3]
-            K = 100
-
-            q1Dot = pinvJ @ (pDot + K*(p - pReal))
-            print(q1Dot)
-            input("Press Enter to continue...")
-            # Second routine, avoid obstacles
-            greenObstPosY = self.model_states.pose[1].position.y
-            redObstPosY   = self.model_states.pose[2].position.y
-
-            # Important to adjust centerpoint with every iteration to acount for movement of obstacles
-            centerPoint = (greenObstPosY+redObstPosY)/2
-
-            # We will try to minimize the y distance of joints 3 4 and 5 from centerPoint
-            distanceVectors = np.matrix([[(self.A03[1,3] - centerPoint)**2], \
-                                         [(self.A04[1,3] - centerPoint)**2], \
-                                         [(self.A04[1,3] - centerPoint)**2]])
-
-            # Calculate gradient decent of distanceVectors:
-            # Get joint positions
-            q1 = self.joint_angpos[0]
-            q2 = self.joint_angpos[1]
-            q3 = self.joint_angpos[2]
-            q4 = self.joint_angpos[3]
-
-            # Get link lengths
-            l1 = self.kinematics.l1
-            l2 = self.kinematics.l2
-            l3 = self.kinematics.l3
-            l4 = self.kinematics.l4
-
-            # Get configuration angles
-            theta1 = self.kinematics.theta1
-
-            objFunc03 = np.zeros((7,1))
-            objFunc03[0] = 2*(self.A03[1,3] - centerPoint)*l2*sin(q2)*cos(q1)
-            objFunc03[1] = 2*(self.A03[1,3] - centerPoint)*l2*sin(q1)*cos(q2)
-
-            objFunc04 = np.zeros((7,1))
-            objFunc04[0] = 2*(self.A04[1,3] - centerPoint)*l2*sin(q2)*(cos(q1) + l3*(-sin(q1)*sin(q3) + cos(q1)*cos(q2)*cos(q3)))
-            objFunc04[1] = 2*(self.A04[1,3] - centerPoint)*(l2*sin(q1)*cos(q2) - l3*sin(q1)*sin(q2)*cos(q3))
-            objFunc04[2] = 2*(self.A04[1,3] - centerPoint)*(l3*(-sin(q1)*sin(q3)*cos(q2) + cos(q1)*cos(q3)))
-
-            objFunc05 = np.zeros((7,1))
-            factor0 = l2*sin(q2)*cos(q1) + l3*(-sin(q1)*sin(q3) + cos(q1)*cos(q2)*cos(q3)) + \
-                      l4*((-sin(q1)*sin(q3) + cos(q1)*cos(q2)*cos(q3))*cos(q4) + sin(q2)*sin(q4)*cos(q1))*sin(theta1) - \
-                      l4*((sin(q1)*sin(q3) - cos(q1)*cos(q2)*cos(q3))*sin(q4) + sin(q2)*cos(q1)*cos(q4))*cos(theta1)
+                q1Dot = pinvJ @ (pDot + K*(p - pReal))
             
-            factor1 = l2*sin(q1)*cos(q2) - l3*sin(q1)*sin(q2)*cos(q3) - \
-                      l4*(sin(q1)*sin(q2)*sin(q4)*cos(q3) + sin(q1)*cos(q2)*cos(q4))*cos(theta1) + \
-                      l4*(-sin(q1)*sin(q2)*cos(q3)*cos(q4) + sin(q1)*sin(q4)*cos(q2))*sin(theta1)
+                # Second routine, avoid obstacles
+                greenObstPosY = self.model_states.pose[1].position.y
+                redObstPosY   = self.model_states.pose[2].position.y
+
+                # Important to adjust centerpoint with every iteration to acount for movement of obstacles
+                centerPoint = (greenObstPosY+redObstPosY)/2
+
+                # We will try to minimize the y distance of joints 3 4 and 5 from centerPoint
+                distanceVectors = np.matrix([[(self.A03[1,3] - centerPoint)**2], \
+                                            [(self.A04[1,3] - centerPoint)**2], \
+                                            [(self.A04[1,3] - centerPoint)**2]])
+
+                # Calculate gradient decent of distanceVectors:
+                # Get joint positions
+                q1 = self.joint_angpos[0]
+                q2 = self.joint_angpos[1]
+                q3 = self.joint_angpos[2]
+                q4 = self.joint_angpos[3]
+
+                # Get link lengths
+                l1 = self.kinematics.l1
+                l2 = self.kinematics.l2
+                l3 = self.kinematics.l3
+                l4 = self.kinematics.l4
+
+                # Get configuration angles
+                theta1 = self.kinematics.theta1
+
+                objFunc03 = np.zeros((7,1))
+                objFunc03[0] = -2*(self.A03[1,3] - centerPoint)*l2*np.sin(q2)*np.cos(q1)
+                objFunc03[1] = -2*(self.A03[1,3] - centerPoint)*l2*np.sin(q1)*np.cos(q2)
+
+                objFunc04 = np.zeros((7,1))
+                objFunc04[0] = -2*(self.A04[1,3] - centerPoint)*l2*np.sin(q2)*np.cos(q1) + l3*(-np.sin(q1)*np.sin(q3) + np.cos(q1)*np.cos(q2)*np.cos(q3))
+                objFunc04[1] = -2*(self.A04[1,3] - centerPoint)*(l2*np.sin(q1)*np.cos(q2) - l3*np.sin(q1)*np.sin(q2)*np.cos(q3))
+                objFunc04[2] = -2*(self.A04[1,3] - centerPoint)*(l3*(-np.sin(q1)*np.sin(q3)*np.cos(q2) + np.cos(q1)*np.cos(q3)))
+
+                objFunc05 = np.zeros((7,1))
+                factor0 = l2*np.sin(q2)*np.cos(q1) + l3*(-np.sin(q1)*np.sin(q3) + np.cos(q1)*np.cos(q2)*np.cos(q3)) + \
+                          l4*((-np.sin(q1)*np.sin(q3) + np.cos(q1)*np.cos(q2)*np.cos(q3))*np.cos(q4) + np.sin(q2)*np.sin(q4)*np.cos(q1))*np.sin(theta1) - \
+                          l4*((np.sin(q1)*np.sin(q3) - np.cos(q1)*np.cos(q2)*np.cos(q3))*np.sin(q4) + np.sin(q2)*np.cos(q1)*np.cos(q4))*np.cos(theta1)
             
-            factor2 = l3*(-sin(q1)*sin(q3)*cos(q2) + cos(q1)*cos(q3)) + \
-                      l4*(-sin(q1)*sin(q3)*cos(q2) + cos(q1)*cos(q3))*sin(theta1)*cos(q4) - \
-                      l4*(sin(q1)*sin(q3)*cos(q2) - cos(q1)*cos(q3))*sin(q4)*cos(theta1)
+                factor1 = l2*np.sin(q1)*np.cos(q2) - l3*np.sin(q1)*np.sin(q2)*np.cos(q3) - \
+                          l4*(np.sin(q1)*np.sin(q2)*np.sin(q4)*np.cos(q3) + np.sin(q1)*np.cos(q2)*np.cos(q4))*np.cos(theta1) + \
+                          l4*(-np.sin(q1)*np.sin(q2)*np.cos(q3)*np.cos(q4) + np.sin(q1)*np.sin(q4)*np.cos(q2))*np.sin(theta1)
             
-            factor3 = -l4*((-sin(q1)*cos(q2)*cos(q3) - sin(q3)*cos(q1))*cos(q4) - sin(q1)*sin(q2)*sin(q4))*cos(theta1) + \
-                       l4*(-(sin(q1)*cos(q2)*cos(q3) + sin(q3)*cos(q1))*sin(q4) + sin(q1)*sin(q2)*cos(q4))*sin(theta1)
+                factor2 = l3*(-np.sin(q1)*np.sin(q3)*np.cos(q2) + np.cos(q1)*np.cos(q3)) + \
+                          l4*(-np.sin(q1)*np.sin(q3)*np.cos(q2) + np.cos(q1)*np.cos(q3))*np.sin(theta1)*np.cos(q4) - \
+                          l4*(np.sin(q1)*np.sin(q3)*np.cos(q2) - np.cos(q1)*np.cos(q3))*np.sin(q4)*np.cos(theta1)
             
-            objFunc05[0] = 2*(self.A05[1,3] - centerPoint)*factor0
-            objFunc05[1] = 2*(self.A05[1,3] - centerPoint)*factor1
-            objFunc05[2] = 2*(self.A05[1,3] - centerPoint)*factor2
-            objFunc05[3] = 2*(self.A05[1,3] - centerPoint)*factor3
-
-            jointWeights = np.array([10,40,10])
-
-            objFunction  = jointWeights[0]*objFunc03 + jointWeights[1]*objFunc04 + jointWeights[2]*objFunc05
+                factor3 = -l4*((-np.sin(q1)*np.cos(q2)*np.cos(q3) - np.sin(q3)*np.cos(q1))*np.cos(q4) - np.sin(q1)*np.sin(q2)*np.sin(q4))*np.cos(theta1) + \
+                           l4*(-(np.sin(q1)*np.cos(q2)*np.cos(q3) + np.sin(q3)*np.cos(q1))*np.sin(q4) + np.sin(q1)*np.sin(q2)*np.cos(q4))*np.sin(theta1)
             
-            # Using theory from lecture slides we know that 
-            Kc = 50
-            q2Dot = Kc*(np.identity(7) - pinvJ @ J) @ objFunction
+                objFunc05[0] = -2*(self.A05[1,3] - centerPoint)*factor0
+                objFunc05[1] = -2*(self.A05[1,3] - centerPoint)*factor1
+                objFunc05[2] = -2*(self.A05[1,3] - centerPoint)*factor2
+                objFunc05[3] = -2*(self.A05[1,3] - centerPoint)*factor3
 
-            self.joint_angvel = [q1Dot[i,0] + q2Dot[i,0] for i in range(7)]
+                jointWeights = np.array([5,8,5])
 
-            print()
-            # for i in range(7):
-            #     self.joint_angvel[i] = q1Dot[i,0] + q2Dot[i,0]
+                objFunction  = jointWeights[0]*objFunc03 + jointWeights[1]*objFunc04 + jointWeights[2]*objFunc05
+                
+                # Using the equations from lecture slides
+                Kc = 50
+                q2Dot = Kc*(np.identity(7) - pinvJ @ J) @ objFunction
 
-            # Convertion to angular position after integrating the angular speed in time
-            # Calculate time interval
-            time_prev = time_now
-            rostime_now = rospy.get_rostime()
-            time_now = rostime_now.to_nsec()
-            dt = (time_now - time_prev)/1e9
-            # Integration
-            self.joint_angpos = np.add( self.joint_angpos, [index * dt for index in self.joint_angvel] )
+                
+                for i in range(7):
+                    self.joint_angvel[i] = q1Dot[i,0] + q2Dot[i,0] #Velocity from both tasks
+                
+                # Append data to lists
+                self.joint_angpos_data.append(self.joint_states.position)
+                self.joint_angvel_data.append(self.joint_states.velocity)
+                self.end_effector_cords.append(self.A07[:3,3])
 
-            # Publish the new joint's angular positions
-            self.joint1_pos_pub.publish(self.joint_angpos[0])
-            self.joint2_pos_pub.publish(self.joint_angpos[1])
-            self.joint3_pos_pub.publish(self.joint_angpos[2])
-            self.joint4_pos_pub.publish(self.joint_angpos[3])
-            self.joint5_pos_pub.publish(self.joint_angpos[4])
-            self.joint6_pos_pub.publish(self.joint_angpos[5])
-            self.joint7_pos_pub.publish(self.joint_angpos[6])
+                # Convertion to angular position after integrating the angular speed in time
+                # Calculate time interval
+                time_prev = time_now
+                rostime_now = rospy.get_rostime()
+                time_now = rostime_now.to_nsec()
+                dt = (time_now - time_prev)/1e9
+                # Integration
+                self.joint_angpos = np.add( self.joint_angpos, [index * dt for index in self.joint_angvel] )
 
-            self.pub_rate.sleep()
+                # Publish the new joint's angular positions
+                self.joint1_pos_pub.publish(self.joint_angpos[0])
+                self.joint2_pos_pub.publish(self.joint_angpos[1])
+                self.joint3_pos_pub.publish(self.joint_angpos[2])
+                self.joint4_pos_pub.publish(self.joint_angpos[3])
+                self.joint5_pos_pub.publish(self.joint_angpos[4])
+                self.joint6_pos_pub.publish(self.joint_angpos[5])
+                self.joint7_pos_pub.publish(self.joint_angpos[6])
 
-            thisIterationIdx = thisIterationIdx+1
+                self.pub_rate.sleep()
 
     def turn_off(self):
         pass
