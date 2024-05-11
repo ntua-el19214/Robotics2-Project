@@ -225,7 +225,7 @@ class xArm7_controller():
                 objFunc05[2] = -2*(self.A05[1,3] - centerPoint)*factor2
                 objFunc05[3] = -2*(self.A05[1,3] - centerPoint)*factor3
 
-                jointWeights = np.array([5,8,5])
+                jointWeights = np.array([6,8,3])
 
                 objFunction  = jointWeights[0]*objFunc03 + jointWeights[1]*objFunc04 + jointWeights[2]*objFunc05
                 
